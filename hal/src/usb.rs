@@ -141,7 +141,6 @@ impl Endpoints {
 
 struct Inner {
     endpoints: Endpoints,
-    set_address: bool,
 }
 
 /// [`usb_device`] implementation.
@@ -157,7 +156,6 @@ impl Usb {
 
         let inner = Inner {
             endpoints: Endpoints::new(),
-            set_address: false,
         };
 
         Self {
@@ -277,6 +275,12 @@ impl Inner {
                 .deveptidr_ctrl_mode(ep)
                 .write(|w| w.stallrqc().set_bit());
 
+            if ep == 0 {
+                self.reg()
+                    .devepticr_ctrl_mode(ep)
+                    .write(|w| w.rxoutic().set_bit());
+            }
+
             if ep != 0 {
                 // Configure endpoint direction.
                 self.reg()
@@ -292,9 +296,15 @@ impl Inner {
                 .cfgok()
                 .bit_is_set()
             {
-                self.reg()
-                    .deveptier_ctrl_mode(ep)
-                    .write(|w| w.rxstpes().set_bit());
+                if ep == 0 {
+                    self.reg()
+                        .deveptier_ctrl_mode(ep)
+                        .write(|w| w.rxstpes().set_bit());
+                } else if conf.ep_dir == UsbDirection::Out {
+                    self.reg()
+                        .deveptier_blk_mode(ep)
+                        .write(|w| w.rxoutes().set_bit());
+                }
                 self.enable_endpoint_interrupt(ep);
             } else {
                 todo!("endpoint configuration failed");
@@ -327,10 +337,7 @@ impl Inner {
         self.reg().devier().write(|w| {
             w.eorstes().set_bit();
             w.suspes().set_bit();
-            w.wakeupes().set_bit();
-
-            // should we use this?
-            w.sofes().set_bit();
+            // w.wakeupes().set_bit();
 
             w
         });
@@ -411,26 +418,36 @@ impl Inner {
     }
 
     fn set_device_address(&mut self, addr: u8) {
-        // Set the address in hardware, but do not enable it. This is
-        // done in poll() on an TXINI.
+        // Set the address in hardware and enable it.
         self.reg().devctrl().modify(|_, w| {
             unsafe {
                 w.uadd().bits(addr);
             }
-            w.adden().clear_bit();
+            w.adden().set_bit();
             w
         });
-        self.set_address = true;
     }
 
     fn poll(&mut self) -> PollResult {
         let dev_isr = self.reg().devisr().read();
+        let dev_imr = self.reg().devimr().read();
 
         if dev_isr.eorst().bit_is_set() {
             // EORST - End of Reset, ack the interrupt and notify
             // stack.
             self.reg().devicr().write(|w| w.eorstc().set_bit());
             return PollResult::Reset;
+        }
+
+        if dev_isr.susp().bit_is_set() && dev_imr.suspe().bit_is_set() {
+            self.reg().devicr().write(|w| w.suspc().set_bit());
+            self.reg().devidr().write(|w| w.suspec().set_bit());
+            self.reg().devier().write(|w| w.wakeupes().set_bit());
+        }
+        if dev_isr.wakeup().bit_is_set() && dev_imr.wakeupe().bit_is_set() {
+            self.reg().devicr().write(|w| w.wakeupc().set_bit());
+            self.reg().devidr().write(|w| w.wakeupec().set_bit());
+            self.reg().devier().write(|w| w.suspes().set_bit());
         }
 
         let mut ep_out = 0;
@@ -443,25 +460,35 @@ impl Inner {
         for ep in BitIter::from((dev_isr.bits() & DEVISR_PEPS_MASK) >> DEVISR_PEPS_OFFSET) {
             let sr = self.reg().deveptisr_ctrl_mode(ep).read();
 
-            // SETUP packet?
-            if sr.rxstpi().bit_is_set() {
-                ep_setup |= 1 << ep;
-            };
-
             // OUT packet?
-            if sr.rxouti().bit_is_set() {
-                ep_out |= 1 << ep;
-            };
+            if ep == 0 {
+                let sr0 = self.reg().deveptisr_ctrl_mode(0).read();
+                let mr0 = self.reg().deveptimr_ctrl_mode(0).read();
+                if mr0.rxoute().bit_is_set() && sr0.rxouti().bit_is_set() {
+                    ep_out |= 1;
+                }
+                // SETUP packet?
+                if ep_out == 0  {
+                    if sr0.rxstpi().bit_is_set() {
+                        ep_setup |= 1 << ep;
+                    };
+                }
+            } else {
+                if sr.rxouti().bit_is_set() {
+                    ep_out |= 1 << ep;
+                };
+            }
 
             // IN packet?
             if sr.txini().bit_is_set() {
-                if self.set_address {
-                    // commit the new address
-                    self.reg().devctrl().modify(|_, w| w.adden().set_bit());
-                    self.set_address = false;
-                }
-
                 ep_in_complete |= 1 << ep;
+
+                if ep == 0 {
+                    // disable TXINI interrupt
+                    self.reg()
+                        .deveptidr_ctrl_mode(ep)
+                        .write(|w| w.txinec().set_bit());
+                }
             };
         }
 
@@ -514,25 +541,27 @@ impl Inner {
 
     fn read(&self, ep_addr: EndpointAddress, buf: &mut [u8]) -> UsbResult<usize> {
         let ep = ep_addr.index();
-        let len = core::cmp::min(
-            self.reg().deveptisr_ctrl_mode(ep).read().byct().bits() as usize,
-            buf.len(),
-        );
+        let deveptisr = self.reg().deveptisr_ctrl_mode(ep).read();
+        let len = core::cmp::min(deveptisr.byct().bits() as _, buf.len());
 
         self.read_fifo(ep, &mut buf[0..len]);
 
         if ep == 0 {
             // control endpoints
-
-            // Clear RXSTPI interrupt, and make FIFO available
-            self.reg()
-                .devepticr_ctrl_mode(0)
-                .write(|w| w.rxstpic().set_bit());
-
-            // Clear RXOUTI
-            self.reg()
-                .devepticr_ctrl_mode(0)
-                .write(|w| w.rxoutic().set_bit());
+            if deveptisr.rxouti().bit_is_set() {
+                // Clear RXOUTI
+                self.reg()
+                    .devepticr_ctrl_mode(0)
+                    .write(|w| w.rxoutic().set_bit());
+            } else if deveptisr.rxstpi().bit_is_set() {
+                // Clear RXSTPI interrupt, and make FIFO available
+                self.reg()
+                    .devepticr_ctrl_mode(0)
+                    .write(|w| w.rxstpic().set_bit());
+            } else {
+                // Should never come here.
+                return Err(UsbError::WouldBlock);
+            }
         } else {
             // Other Endpoints
 
@@ -550,21 +579,32 @@ impl Inner {
         Ok(len)
     }
 
-    fn is_stalled(&self, _ep: EndpointAddress) -> bool {
-        // stub: seemingly not required
-        false
+    fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
+        let ep = ep_addr.index();
+        if ep == 0 {
+            self.reg().deveptimr_ctrl_mode(ep).read().stallrq().bit()
+        } else {
+            false
+        }
     }
 
-    fn set_stalled(&self, _ep: EndpointAddress, _stalled: bool) {
-        // stub: seemingly not required
+    fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
+        let ep = ep_addr.index();
+        if ep == 0 {
+            if stalled {
+                self.reg()
+                    .deveptier_ctrl_mode(ep)
+                    .write(|w| w.stallrqs().set_bit());
+            } else {
+                self.reg()
+                    .deveptidr_ctrl_mode(ep)
+                    .write(|w| w.stallrqc().set_bit());
+            }
+        }
     }
 }
 
 impl usb_device::bus::UsbBus for Usb {
-    /// Ensure the address is set before write of zero sized packet to
-    /// confirm a SET_ADDRESS transaction.
-    const QUIRK_SET_ADDRESS_BEFORE_STATUS: bool = true;
-
     fn enable(&mut self) {
         interrupt::free(|cs| unsafe { &mut *self.inner.borrow(cs).get() }.enable());
     }

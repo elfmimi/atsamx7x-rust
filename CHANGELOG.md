@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Fix issues with USB that were affecting reliable operation.
 
 ## [v0.4.6] 2025-03-31
 
