@@ -78,6 +78,15 @@ use usb_device::{Result as UsbResult, UsbDirection, UsbError};
 use bit_iter::BitIter;
 pub use usb_device;
 
+#[cfg(feature="usb_log")]
+use rtt_target::{rprint, rprintln};
+#[cfg(not(feature="usb_log"))]
+#[macro_use]
+#[allow(unused)]
+mod nullfmt {
+    macro_rules! rprint { ($($arg:tt)*) => { let _ = ($($arg)*); } }
+    macro_rules! rprintln { ($($arg:tt)*) => { let _ = ($($arg)*); } }
+}
 const NUM_ENDPOINTS: usize = 10;
 
 /// Endpoint configuration.
@@ -266,6 +275,7 @@ impl Inner {
 
                 w
             });
+            // self.reg().deveptcfg(ep).modify(|_, w| { w.alloc().set_bit() });
 
             // setup RSTDTS, STALLRQC
             self.reg()
@@ -360,6 +370,7 @@ impl Inner {
     /// receive/transmit bank FIFO counters, and endpoint
     /// configuration registers.
     fn reset(&self) {
+        rprintln!("UsbBus reset");
         // Assume USB endpoints already configured by `enable`.
         // Further, we don't need to reset ep0; this is done by
         // hardware.
@@ -395,6 +406,8 @@ impl Inner {
         for ep in 0..NUM_ENDPOINTS {
             self.open_endpoint(ep);
         }
+        let dev_imr = self.reg().devimr().read();
+        rprintln!("DEVIMR 0x{:08X}", dev_imr.bits());
     }
 
     fn alloc_ep(
@@ -418,6 +431,7 @@ impl Inner {
     }
 
     fn set_device_address(&mut self, addr: u8) {
+        rprintln!("Set Device Address 0x{:02X}", addr);
         // Set the address in hardware and enable it.
         self.reg().devctrl().modify(|_, w| {
             unsafe {
@@ -431,20 +445,31 @@ impl Inner {
     fn poll(&mut self) -> PollResult {
         let dev_isr = self.reg().devisr().read();
         let dev_imr = self.reg().devimr().read();
+        let sr0 = self.reg().deveptisr_ctrl_mode(0).read();
+        let mr0 = self.reg().deveptimr_ctrl_mode(0).read();
+        // rprintln!("DEV 0x{:08X} 0x{:08X}", dev_isr.bits(), dev_imr.bits());        
+        rprint!("DEV 0x{:08X}", dev_isr.bits() & dev_imr.bits());
+        if dev_isr.bits() & 0x0000_1000 != 0 {
+            rprint!("  EP0 0x{:08X}", sr0.bits() & mr0.bits());
+        }
+        rprintln!();
 
         if dev_isr.eorst().bit_is_set() {
             // EORST - End of Reset, ack the interrupt and notify
             // stack.
+            rprintln!("EORST");
             self.reg().devicr().write(|w| w.eorstc().set_bit());
             return PollResult::Reset;
         }
 
         if dev_isr.susp().bit_is_set() && dev_imr.suspe().bit_is_set() {
+            rprintln!("SUSPEND");
             self.reg().devicr().write(|w| w.suspc().set_bit());
             self.reg().devidr().write(|w| w.suspec().set_bit());
             self.reg().devier().write(|w| w.wakeupes().set_bit());
         }
         if dev_isr.wakeup().bit_is_set() && dev_imr.wakeupe().bit_is_set() {
+            rprintln!("WAKEUP");
             self.reg().devicr().write(|w| w.wakeupc().set_bit());
             self.reg().devidr().write(|w| w.wakeupec().set_bit());
             self.reg().devier().write(|w| w.suspes().set_bit());
@@ -462,15 +487,14 @@ impl Inner {
 
             // OUT packet?
             if ep == 0 {
-                let sr0 = self.reg().deveptisr_ctrl_mode(0).read();
-                let mr0 = self.reg().deveptimr_ctrl_mode(0).read();
+                // let mr = self.reg().deveptimr_ctrl_mode(0).read();
                 if mr0.rxoute().bit_is_set() && sr0.rxouti().bit_is_set() {
                     ep_out |= 1;
                 }
                 // SETUP packet?
                 if ep_out == 0  {
                     if sr0.rxstpi().bit_is_set() {
-                        ep_setup |= 1 << ep;
+                        ep_setup |= 1;
                     };
                 }
             } else {
@@ -481,13 +505,16 @@ impl Inner {
 
             // IN packet?
             if sr.txini().bit_is_set() {
-                ep_in_complete |= 1 << ep;
-
                 if ep == 0 {
-                    // disable TXINI interrupt
-                    self.reg()
-                        .deveptidr_ctrl_mode(ep)
-                        .write(|w| w.txinec().set_bit());
+                    if mr0.txine().bit_is_set() {
+                        ep_in_complete |= 1;
+                        // disable TXINI interrupt
+                        self.reg()
+                            .deveptidr_ctrl_mode(ep)
+                            .write(|w| w.txinec().set_bit());
+                    }
+                } else {
+                    ep_in_complete |= 1 << ep;
                 }
             };
         }
@@ -510,6 +537,8 @@ impl Inner {
         self.write_fifo(ep, buf);
 
         if ep == 0 {
+            rprintln!("EP0 Write len={}", buf.len());
+            dump_data(&buf);
             // clear TXINI to send the package
             self.reg()
                 .devepticr_ctrl_mode(0)
@@ -544,11 +573,15 @@ impl Inner {
         let deveptisr = self.reg().deveptisr_ctrl_mode(ep).read();
         let len = core::cmp::min(deveptisr.byct().bits() as _, buf.len());
 
+        rprintln!("EP{} read len={} byct={}", ep, len, deveptisr.byct().bits());
         self.read_fifo(ep, &mut buf[0..len]);
 
         if ep == 0 {
             // control endpoints
+            dump_data(&buf[0..len]);
+
             if deveptisr.rxouti().bit_is_set() {
+                rprintln!("Clear RXOUTI");
                 // Clear RXOUTI
                 self.reg()
                     .devepticr_ctrl_mode(0)
@@ -605,6 +638,10 @@ impl Inner {
 }
 
 impl usb_device::bus::UsbBus for Usb {
+    /// Ensure the address is set before write of zero sized packet to
+    /// confirm a SET_ADDRESS transaction.
+    const QUIRK_SET_ADDRESS_BEFORE_STATUS: bool = false;
+
     fn enable(&mut self) {
         interrupt::free(|cs| unsafe { &mut *self.inner.borrow(cs).get() }.enable());
     }
@@ -666,5 +703,19 @@ impl usb_device::bus::UsbBus for Usb {
 
     fn force_reset(&self) -> UsbResult<()> {
         Err(UsbError::Unsupported)
+    }
+}
+
+fn dump_data(buf: &[u8]) {
+    for i in 0..buf.len() {
+        if i % 16 == 0 {
+            rprint!("    ");
+        }
+        rprint!("{:02X}", buf[i]);
+        if (i + 1) % 16 == 0 || i + 1 == buf.len() {
+            rprintln!();
+        } else {
+            rprint!(", ");
+        }
     }
 }

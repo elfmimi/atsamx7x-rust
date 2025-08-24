@@ -40,6 +40,7 @@ void = { version = "1", default-features = false }
 strum = { version = "0.26.3", default-features = false, features = ["derive"]}
 cfg-if = "1"
 mcan-core = { version = "0.2", optional = true }
+rtt-target = { version = "0.3.1" }
 atsame70j19b = { version = "0.33.5", optional = true }
 atsame70j20b = { version = "0.33.5", optional = true }
 atsame70j21b = { version = "0.33.5", optional = true }
@@ -164,6 +165,7 @@ critical-section = [
       "atsamv71q19b?/critical-section", "atsamv71q20b?/critical-section",
       "atsamv71q21b?/critical-section"]
 
+usb_log = []
 
 [package.metadata.docs.rs]
 # docs.rs build target
